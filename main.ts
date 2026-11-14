@@ -1,4 +1,4 @@
-// Token Radar v1: comps-based token launch radar (Node 22, standard library only).
+// Token Radar v2: size-fitted token launch radar (Node 22, standard library only).
 //
 // Reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>),
 // scores every pre-token protocol with the model in lib/model.ts, writes the

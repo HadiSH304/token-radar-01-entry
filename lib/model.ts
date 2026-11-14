@@ -1,25 +1,34 @@
-// Token Radar v1 model: category comps valuation.
+// Token Radar v2 model: size-fitted valuation over a launch-candidate
+// universe.
 //
-// Every pre-token protocol is priced off the live market, not off a fixed
-// constant: its implied value is TVL times the median FDV/TVL multiple of
-// the live-token protocols in its own category, adjusted for 7-day TVL
-// growth and for how long it has run with no token on record. Categories
-// with too few live peers fall back to the global median multiple, so no
-// row is ever priced from a single peer. All weights and multipliers live
-// in CONFIG below, in one block, so a later dev-heat read can retune them
-// in one place.
+// The board ranks launch candidates only, not every pre-token protocol:
+// CEX, Bridge and Canonical Bridge rows are excluded (venues and asset
+// movers whose tokens already exist, or claims on existing assets), and of
+// the rest a protocol makes the board when its category holds at least 3
+// live comps, when it sits on the snapshot watchlist, or when its TVL is
+// at least $20M. Every watchlist slug still lands on the board.
 //
-//   base       = tvl_usd x category_multiple
+// Prices come from a line fitted to protocol size on the live comps pool:
+//
+//   log(mcap)  = a + b x log(TVL)          (robust least squares)
+//   base       = exp(fitted log mcap), the category fit blended in where
+//                the category holds at least 8 comps (weight n/(n+6) on
+//                the category line); below that the global line plus the
+//                category's median residual, shrunk by the same weight
 //   growth     = 1 + clamp(change_7d, -50, 100) / 100 x GROWTH_WEIGHT
 //   maturity   = 0.70 + 0.50 x min(age_days, 1460) / 1460   (age unknown: 0.95)
 //   implied    = max(1, round(base x growth x maturity))
 //
-// The model also backtests itself on the snapshot's listed protocols: for
-// each live protocol whose category holds at least 3 other comps, it
-// predicts the market cap from TVL and the peer median excluding itself,
-// and reports the median absolute percentage error (MdAPE). Farm plans are
-// built per row from category playbook x TVL tier x primary-chain gas tier,
-// so two rows never share the same plan text with names swapped.
+// All weights and multipliers live in CONFIG below, in one block, so a
+// later dev-heat read can retune them in one place.
+//
+// The model also backtests itself, leave-one-out, on the snapshot's
+// listed protocols: each live protocol's market cap is predicted from a
+// fit that excludes it, and the board reports the median absolute
+// percentage error (MdAPE) and the median signed percentage error next to
+// the previous model's 91.81% MdAPE. Farm plans are built per row from
+// category playbook x TVL tier x primary-chain gas tier, so two rows
+// never share the same plan text with names swapped.
 
 /** Every scoring weight and multiplier, in one block. Retune here only. */
 export const CONFIG = {
@@ -30,9 +39,14 @@ export const CONFIG = {
   maturity_range: 0.5,
   maturity_days: 1460,
   unknown_age_mult: 0.95,
-  min_comps: 3,
-  trim_threshold: 8,
-  trim_pct: 0.1,
+  universe_excluded_categories: ['CEX', 'Bridge', 'Canonical Bridge'],
+  universe_min_category_comps: 3,
+  universe_min_tvl_usd: 20_000_000,
+  category_line_min_comps: 8,
+  blend_shrink_k: 6,
+  huber_k: 1.345,
+  huber_iterations: 4,
+  previous_mdape_pct: 91.81,
   airdrop_default_pct: 0.1,
   airdrop_high_pct: 0.15,
   airdrop_low_pct: 0.05,
@@ -46,7 +60,7 @@ export const CONFIG = {
 } as const;
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-comps-v1';
+export const MODEL_VERSION = 'radar-fit-v2';
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -94,17 +108,8 @@ function medianOf(values: number[]): number {
   return s.length % 2 === 1 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2;
 }
 
-/**
- * Category median multiple. With >= 8 comps the median is trimmed: the top
- * and bottom 10% of ratios are dropped first, so one outsized listing
- * cannot drag the sector's multiple.
- */
+/** Category median multiple, kept as a descriptive statistic for the comps record; pricing no longer uses it. */
 function categoryMultiple(ratios: number[]): number {
-  if (ratios.length >= CONFIG.trim_threshold) {
-    const drop = Math.floor(ratios.length * CONFIG.trim_pct);
-    const s = [...ratios].sort((a, b) => a - b);
-    return medianOf(s.slice(drop, s.length - drop));
-  }
   return medianOf(ratios);
 }
 
@@ -168,42 +173,177 @@ export function buildComps(snapshot: Snapshot): CompStats {
   return { pool_size: live.length, global_median: round4(globalMedian), categories_with_comps: byCat.size, by_category };
 }
 
-/** A category's multiple: its own trimmed median when it holds >= 3 comps, else the global median. */
-export function multipleFor(category: string | null, comps: CompStats): { multiple: number; comp_count: number; fallback: boolean; peers: PeerComp[] } {
-  const key = category ?? 'Other';
-  const entry = comps.by_category[key];
-  if (entry !== undefined && entry.count >= CONFIG.min_comps) {
-    return { multiple: entry.multiple, comp_count: entry.count, fallback: false, peers: entry.peers };
-  }
-  // Fallback pool: the whole live market's top-3 by market cap, as the audit trail.
-  const allPeers = Object.values(comps.by_category)
-    .flatMap((e) => e.peers)
-    .sort((a, b) => b.mcap_usd - a.mcap_usd)
-    .slice(0, 3)
-    .map((p) => ({ name: p.name, ratio: p.ratio, mcap_usd: p.mcap_usd }));
-  return { multiple: comps.global_median, comp_count: entry?.count ?? 0, fallback: true, peers: allPeers };
+// ---------------------------------------------------------------------------
+// Size fit: log(mcap) = a + b x log(TVL), robust least squares
+// ---------------------------------------------------------------------------
+
+export interface LineFit {
+  a: number;
+  b: number;
 }
 
-/** The self-backtest: predict each listed protocol's market cap from its TVL and its peers, excluding itself. */
-export function backtest(snapshot: Snapshot, comps: CompStats): { tested: number; mdape_pct: number } {
-  const live = snapshot.protocols.filter(isLiveComp);
+/** Weighted least squares of log mcap on log TVL. Assumes at least two points with spread. */
+function olsFit(points: { x: number; y: number }[], weights: number[] | null): LineFit {
+  const n = points.length;
+  let sw = 0;
+  let mx = 0;
+  let my = 0;
+  for (let i = 0; i < n; i++) {
+    const w = weights === null ? 1 : weights[i]!;
+    sw += w;
+    mx += w * points[i]!.x;
+    my += w * points[i]!.y;
+  }
+  mx /= sw;
+  my /= sw;
+  let sxy = 0;
+  let sxx = 0;
+  for (let i = 0; i < n; i++) {
+    const w = weights === null ? 1 : weights[i]!;
+    sxy += w * (points[i]!.x - mx) * (points[i]!.y - my);
+    sxx += w * (points[i]!.x - mx) ** 2;
+  }
+  const b = sxx > 0 ? sxy / sxx : 0;
+  return { a: my - b * mx, b };
+}
+
+/**
+ * Least squares with Huber weights, iterated: residuals are scaled by
+ * their own median absolute deviation, and any point past huber_k scaled
+ * deviations counts for less. One outsized listing cannot bend the line
+ * the way it bends a plain fit.
+ */
+function robustFit(points: { x: number; y: number }[]): LineFit {
+  let line = olsFit(points, null);
+  for (let iter = 0; iter < CONFIG.huber_iterations; iter++) {
+    const residuals = points.map((pt) => pt.y - (line.a + line.b * pt.x));
+    const centre = medianOf(residuals);
+    const sigma = 1.4826 * medianOf(residuals.map((r) => Math.abs(r - centre)));
+    if (!Number.isFinite(sigma) || sigma <= 0) break;
+    const cap = CONFIG.huber_k * sigma;
+    const weights = residuals.map((r) => {
+      const d = Math.abs(r);
+      return d <= cap ? 1 : cap / d;
+    });
+    line = olsFit(points, weights);
+  }
+  return line;
+}
+
+type CategoryFit =
+  | { kind: 'line'; line: LineFit; count: number }
+  | { kind: 'offset'; resid: number; count: number };
+
+export interface SizeFit {
+  global: LineFit;
+  by_category: Map<string, CategoryFit>;
+  /** Median TVL of the live comps, the pricing point for a row with no positive TVL. */
+  global_median_tvl: number;
+  /** Per-category median TVL of the live comps. */
+  category_median_tvl: Map<string, number>;
+  line_categories: number;
+  offset_categories: number;
+}
+
+/** Fit the size lines on a pool of live comps: one global line, one line or shrunk offset per category. */
+export function buildFit(pool: SnapshotProtocol[]): SizeFit {
+  const points = pool.map((p) => ({ x: Math.log(p.tvl_usd), y: Math.log(p.mcap_usd!) }));
+  const global = robustFit(points);
   const byCat = new Map<string, SnapshotProtocol[]>();
-  for (const p of live) {
+  for (const p of pool) {
     const key = p.category ?? 'Other';
     const list = byCat.get(key) ?? [];
     list.push(p);
     byCat.set(key, list);
   }
-  const errors: number[] = [];
-  for (const p of live) {
-    const others = (byCat.get(p.category ?? 'Other') ?? []).filter((q) => q.slug !== p.slug);
-    if (others.length < CONFIG.min_comps) continue;
-    const ratios = others.map((q) => q.mcap_usd! / q.tvl_usd);
-    const predicted = p.tvl_usd * categoryMultiple(ratios);
-    errors.push(Math.abs(predicted - p.mcap_usd!) / p.mcap_usd!);
+  const by_category = new Map<string, CategoryFit>();
+  const category_median_tvl = new Map<string, number>();
+  let lineCats = 0;
+  let offsetCats = 0;
+  for (const [cat, list] of byCat) {
+    category_median_tvl.set(cat, medianOf(list.map((p) => p.tvl_usd)));
+    if (list.length >= CONFIG.category_line_min_comps) {
+      by_category.set(cat, { kind: 'line', line: robustFit(list.map((p) => ({ x: Math.log(p.tvl_usd), y: Math.log(p.mcap_usd!) }))), count: list.length });
+      lineCats++;
+    } else {
+      const resid = medianOf(list.map((p) => Math.log(p.mcap_usd!) - (global.a + global.b * Math.log(p.tvl_usd))));
+      by_category.set(cat, { kind: 'offset', resid, count: list.length });
+      offsetCats++;
+    }
   }
-  if (errors.length === 0) return { tested: 0, mdape_pct: 0 };
-  return { tested: errors.length, mdape_pct: round4(medianOf(errors) * 100) };
+  return {
+    global,
+    by_category,
+    global_median_tvl: pool.length > 0 ? medianOf(pool.map((p) => p.tvl_usd)) : 0,
+    category_median_tvl,
+    line_categories: lineCats,
+    offset_categories: offsetCats,
+  };
+}
+
+export interface FittedValue {
+  /** exp(fitted log mcap) at the protocol's TVL, before growth and maturity. */
+  base_usd: number;
+  /** base_usd over TVL (over the category median TVL for a floor row). */
+  fitted_multiple: number;
+  /** 'category' when the category fit carries at least half the weight, else 'global'. */
+  fit_source: 'category' | 'global';
+  /** The category weight n/(n+6); 0 when the category holds no comps. */
+  fit_weight: number;
+  comp_count: number;
+  floor_estimate: boolean;
+}
+
+/** Price one protocol off the fitted lines. Never returns NaN, Infinity or a non-positive value. */
+export function fittedValue(p: SnapshotProtocol, fit: SizeFit): FittedValue {
+  const key = p.category ?? 'Other';
+  const cat = fit.by_category.get(key);
+  const count = cat?.count ?? 0;
+  const weight = count / (count + CONFIG.blend_shrink_k);
+  const floor = !(p.tvl_usd > 0);
+  const tvlPoint = floor ? (fit.category_median_tvl.get(key) ?? fit.global_median_tvl) : p.tvl_usd;
+  const logTvl = Math.log(Math.max(tvlPoint, 1));
+  const globalLog = fit.global.a + fit.global.b * logTvl;
+  let fittedLog = globalLog;
+  if (cat !== undefined) {
+    if (cat.kind === 'line') {
+      const catLog = cat.line.a + cat.line.b * logTvl;
+      fittedLog = (1 - weight) * globalLog + weight * catLog;
+    } else {
+      fittedLog = globalLog + weight * cat.resid;
+    }
+  }
+  let base = Math.exp(fittedLog);
+  if (!Number.isFinite(base) || base <= 0) base = 1;
+  return {
+    base_usd: base,
+    fitted_multiple: round4(base / Math.max(tvlPoint, 1)),
+    fit_source: cat !== undefined && cat.kind === 'line' && weight >= 0.5 ? 'category' : 'global',
+    fit_weight: round4(weight),
+    comp_count: count,
+    floor_estimate: floor,
+  };
+}
+
+/**
+ * The leave-one-out self-backtest: each live protocol's market cap is
+ * predicted from a fit on the rest of the pool, growth and maturity left
+ * out, so the figure grades the fit itself.
+ */
+export function backtest(snapshot: Snapshot): { tested: number; mdape_pct: number; median_signed_pct: number } {
+  const live = snapshot.protocols.filter(isLiveComp);
+  const absolute: number[] = [];
+  const signed: number[] = [];
+  for (const p of live) {
+    const pool = live.filter((q) => q.slug !== p.slug);
+    if (pool.length < 2) continue;
+    const fit = buildFit(pool);
+    const predicted = fittedValue(p, fit).base_usd;
+    absolute.push(Math.abs(predicted - p.mcap_usd!) / p.mcap_usd!);
+    signed.push((predicted - p.mcap_usd!) / p.mcap_usd!);
+  }
+  if (absolute.length === 0) return { tested: 0, mdape_pct: 0, median_signed_pct: 0 };
+  return { tested: absolute.length, mdape_pct: round4(medianOf(absolute) * 100), median_signed_pct: round4(medianOf(signed) * 100) };
 }
 
 // ---------------------------------------------------------------------------
@@ -378,9 +518,10 @@ export interface BoardRow {
   watchlist: boolean;
   implied_value_usd: number;
   model: {
-    category_multiple: number;
+    fitted_multiple: number;
+    fit_source: 'category' | 'global';
+    fit_weight: number;
     comp_count: number;
-    comps_fallback: boolean;
     peers: PeerComp[];
     base_usd: number;
     growth_multiplier: number;
@@ -418,11 +559,23 @@ export interface RadarData {
   model_version: string;
   config: typeof CONFIG;
   total_protocols: number;
+  pre_token_size: number;
   watchlist_size: number;
   board_size: number;
   live_size: number;
   comps: CompStats;
-  backtest: { tested: number; mdape_pct: number };
+  fit: {
+    global_intercept: number;
+    global_slope: number;
+    line_categories: number;
+    offset_categories: number;
+  };
+  universe: {
+    excluded_categories: readonly string[];
+    min_category_comps: number;
+    min_tvl_usd: number;
+  };
+  backtest: { tested: number; mdape_pct: number; median_signed_pct: number; previous_mdape_pct: number };
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -440,58 +593,61 @@ function airdropSharePct(category: string | null): number {
   return CONFIG.airdrop_default_pct;
 }
 
-/**
- * The protocols the board ranks, strongest first, with ranks 1..n.
- * Every pre-token protocol in the snapshot is ranked: the watchlist is the
- * floor, and the board covers all 342 pre-token protocols.
- */
-export function buildBoard(snapshot: Snapshot, comps: CompStats): BoardRow[] {
-  const preTokenProtocols = snapshot.protocols.filter(isPreToken);
-  const watch = new Set(snapshot.watchlist);
-  const preTokenList = preTokenProtocols.map((p) => {
-    const age = ageDays(snapshot.as_of, p.listed_at);
-    const { multiple, comp_count, fallback, peers } = multipleFor(p.category, comps);
-    const growthPct = p.change_7d === null ? 0 : Math.min(CONFIG.growth_clamp_max, Math.max(CONFIG.growth_clamp_min, p.change_7d));
-    const growthMult = p.change_7d === null ? 1 : 1 + (growthPct / 100) * CONFIG.growth_weight;
-    const maturityMult = age === null ? CONFIG.unknown_age_mult : CONFIG.maturity_floor + (Math.min(Math.max(age, 0), CONFIG.maturity_days) / CONFIG.maturity_days) * CONFIG.maturity_range;
-    const base = p.tvl_usd * multiple;
-    const estFdv = Math.max(1, Math.round(base * growthMult * maturityMult));
-    return { p, age, multiple, comp_count, fallback, peers, growthMult, maturityMult, base, estFdv };
-  });
+/** Whether a pre-token protocol belongs to the launch-candidate universe the board ranks. */
+export function inUniverse(p: SnapshotProtocol, comps: CompStats, watch: Set<string>): boolean {
+  const key = p.category ?? 'Other';
+  if ((CONFIG.universe_excluded_categories as readonly string[]).includes(key)) return false;
+  if (watch.has(p.slug)) return true;
+  if ((comps.by_category[key]?.count ?? 0) >= CONFIG.universe_min_category_comps) return true;
+  return p.tvl_usd >= CONFIG.universe_min_tvl_usd;
+}
 
-  // Automated verification, in the model's own terms.
-  console.assert(preTokenList.length === 342, "Harus tepat 342 protokol!");
-  console.assert(preTokenList.every(p => Number.isFinite(p.estFdv) && p.estFdv > 0), "Ada valuasi invalid!");
-  if (preTokenList.length !== 342) throw new Error(`token radar: expected 342 pre-token protocols, found ${preTokenList.length}`);
-  if (!preTokenList.every((s) => Number.isFinite(s.estFdv) && s.estFdv > 0)) throw new Error('token radar: a row has an invalid implied value');
+/**
+ * The protocols the board ranks, strongest first, with ranks 1..n: the
+ * launch-candidate universe (see inUniverse), priced off the size fit.
+ */
+export function buildBoard(snapshot: Snapshot, comps: CompStats, fit: SizeFit): BoardRow[] {
+  const watch = new Set(snapshot.watchlist);
   const missingWatch = snapshot.watchlist.filter((s) => !bySlug(snapshot.protocols).has(s));
   if (missingWatch.length > 0) throw new Error(`token radar: watchlist slugs missing from the snapshot: ${missingWatch.join(', ')}`);
+  const globalPeers = Object.values(comps.by_category)
+    .flatMap((e) => e.peers)
+    .sort((a, b) => b.mcap_usd - a.mcap_usd)
+    .slice(0, 3);
+  const preTokenList = snapshot.protocols
+    .filter(isPreToken)
+    .filter((p) => inUniverse(p, comps, watch))
+    .map((p) => {
+      const age = ageDays(snapshot.as_of, p.listed_at);
+      const fv = fittedValue(p, fit);
+      const growthPct = p.change_7d === null ? 0 : Math.min(CONFIG.growth_clamp_max, Math.max(CONFIG.growth_clamp_min, p.change_7d));
+      const growthMult = p.change_7d === null ? 1 : 1 + (growthPct / 100) * CONFIG.growth_weight;
+      const maturityMult = age === null ? CONFIG.unknown_age_mult : CONFIG.maturity_floor + (Math.min(Math.max(age, 0), CONFIG.maturity_days) / CONFIG.maturity_days) * CONFIG.maturity_range;
+      const estFdv = Math.max(1, Math.round(fv.base_usd * growthMult * maturityMult));
+      const catPeers = comps.by_category[p.category ?? 'Other']?.peers;
+      return { p, age, fv, growthMult, maturityMult, estFdv, peers: catPeers !== undefined && catPeers.length > 0 ? catPeers : globalPeers };
+    });
 
-  // Floor estimate for a row with no positive TVL (the snapshot floors at
-  // $5M, so this should not occur): the category's median implied value.
-  const byCatImplied = new Map<string, number[]>();
-  for (const s of preTokenList) {
-    if (s.p.tvl_usd <= 0) continue;
-    const key = s.p.category ?? 'Other';
-    const list = byCatImplied.get(key) ?? [];
-    list.push(s.estFdv);
-    byCatImplied.set(key, list);
-  }
-  const allImplied = preTokenList.filter((s) => s.p.tvl_usd > 0).map((s) => s.estFdv);
-  for (const s of preTokenList) {
-    if (s.p.tvl_usd > 0) continue;
-    const catVals = byCatImplied.get(s.p.category ?? 'Other');
-    s.estFdv = catVals !== undefined && catVals.length > 0 ? Math.round(medianOf(catVals)) : Math.round(medianOf(allImplied));
-  }
+  // Automated verification, in the model's own terms: every watchlist
+  // slug on the board, every implied value finite and positive, and the
+  // board in rank order once sorted.
+  const boardSlugs = new Set(preTokenList.map((s) => s.p.slug));
+  const offBoard = snapshot.watchlist.filter((s) => !boardSlugs.has(s));
+  console.assert(offBoard.length === 0, 'Watchlist ada yang tertinggal dari board!');
+  console.assert(preTokenList.every((p) => Number.isFinite(p.estFdv) && p.estFdv > 0), 'Ada valuasi invalid!');
+  if (offBoard.length > 0) throw new Error(`token radar: watchlist slugs left off the board: ${offBoard.join(', ')}`);
+  if (!preTokenList.every((s) => Number.isFinite(s.estFdv) && s.estFdv > 0)) throw new Error('token radar: a row has an invalid implied value');
 
   preTokenList.sort((a, b) => b.estFdv - a.estFdv || b.p.tvl_usd - a.p.tvl_usd || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
+  for (let i = 1; i < preTokenList.length; i++) {
+    if (preTokenList[i]!.estFdv > preTokenList[i - 1]!.estFdv) throw new Error('token radar: board rows are not in rank order');
+  }
   return preTokenList.map((s, i) => {
     const sharePct = airdropSharePct(s.p.category);
     const pool = Math.round(s.estFdv * sharePct);
     const wallets = CONFIG.wallets_by_tvl_tier[tvlTier(s.p.tvl_usd)];
     const perWallet = Math.round((pool / wallets) * 100) / 100;
     const plan = farmPlan(s.p, s.age, perWallet);
-    const floorEstimate = s.p.tvl_usd <= 0;
     return {
       rank: i + 1,
       slug: s.p.slug,
@@ -504,14 +660,15 @@ export function buildBoard(snapshot: Snapshot, comps: CompStats): BoardRow[] {
       watchlist: watch.has(s.p.slug),
       implied_value_usd: s.estFdv,
       model: {
-        category_multiple: s.multiple,
-        comp_count: s.comp_count,
-        comps_fallback: s.fallback,
+        fitted_multiple: s.fv.fitted_multiple,
+        fit_source: s.fv.fit_source,
+        fit_weight: s.fv.fit_weight,
+        comp_count: s.fv.comp_count,
         peers: s.peers,
-        base_usd: Math.round(s.base),
+        base_usd: Math.round(s.fv.base_usd),
         growth_multiplier: round4(s.growthMult),
         maturity_multiplier: round4(s.maturityMult),
-        floor_estimate: floorEstimate,
+        floor_estimate: s.fv.floor_estimate,
       },
       airdrop: { pool_usd: pool, share_pct: sharePct, per_wallet_usd: perWallet, wallets_assumed: wallets },
       gas: plan.gas,
@@ -542,9 +699,10 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: RadarData } {
   const comps = buildComps(snapshot);
-  const board = buildBoard(snapshot, comps);
+  const fit = buildFit(snapshot.protocols.filter(isLiveComp));
+  const board = buildBoard(snapshot, comps, fit);
   const live = liveRows(snapshot);
-  const bt = backtest(snapshot, comps);
+  const bt = backtest(snapshot);
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -552,11 +710,23 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     model_version: MODEL_VERSION,
     config: CONFIG,
     total_protocols: snapshot.protocols.length,
+    pre_token_size: snapshot.protocols.filter(isPreToken).length,
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
     live_size: live.length,
     comps,
-    backtest: bt,
+    fit: {
+      global_intercept: round4(fit.global.a),
+      global_slope: round4(fit.global.b),
+      line_categories: fit.line_categories,
+      offset_categories: fit.offset_categories,
+    },
+    universe: {
+      excluded_categories: CONFIG.universe_excluded_categories,
+      min_category_comps: CONFIG.universe_min_category_comps,
+      min_tvl_usd: CONFIG.universe_min_tvl_usd,
+    },
+    backtest: { tested: bt.tested, mdape_pct: bt.mdape_pct, median_signed_pct: bt.median_signed_pct, previous_mdape_pct: CONFIG.previous_mdape_pct },
     rows: board,
     live,
   };
