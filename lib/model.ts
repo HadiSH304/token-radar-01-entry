@@ -42,7 +42,7 @@ export const CONFIG = {
   // per-wallet figure in the detail view. Stated in the dashboard as the
   // entry's own assumption, never a promise.
   wallets_by_tvl_tier: [250_000, 100_000, 40_000, 15_000],
-  farm_horizon_weeks: 12,
+  farm_weeks: 12,
 } as const;
 
 /** The model's version label: the dashboard names it. */
@@ -295,13 +295,13 @@ function coreAction(pb: Playbook, name: string, chain: string, capital: string, 
     case 'cdp':
       return `Lock ${capital} of collateral in ${name} on ${chain}, mint the stable asset against it, and keep the collateral ratio above the app's safe line.${singleSided} ${framing}.`;
     case 'rwa':
-      return `Mint ${capital} of ${name}'s yield asset on ${chain} and hold it in the farming wallet for the full horizon.${singleSided} ${framing}.`;
+      return `Mint ${capital} of ${name}'s yield asset on ${chain} and hold it in the farming wallet for the full 12 weeks.${singleSided} ${framing}.`;
     case 'cex':
       return `Deposit ${capital} to ${name}, place a spot trade on ${chain} and one limit order, and keep a small balance on the venue between trades.${singleSided} ${framing}.`;
     case 'vault':
-      return `Deposit ${capital} into a ${name} vault on ${chain} and keep the shares for the full horizon so the position reads as one long allocation.${singleSided} ${framing}.`;
+      return `Deposit ${capital} into a ${name} vault on ${chain} and keep the shares for the full 12 weeks so the position reads as one long allocation.${singleSided} ${framing}.`;
     case 'insurance':
-      return `Buy ${capital} of cover from ${name} on ${chain} and keep the policy active for the full horizon.${singleSided} ${framing}.`;
+      return `Buy ${capital} of cover from ${name} on ${chain} and keep the policy active for the full 12 weeks.${singleSided} ${framing}.`;
     default:
       return `Deposit ${capital} of USDC into ${name} on ${chain} and use the app's main feature once a week.${singleSided} ${framing}.`;
   }
@@ -312,13 +312,13 @@ function cadenceStep(pb: Playbook, name: string, chain: string, gas: GasTier, ca
   const n = gas.actions_per_week;
   const cost = (gas.cost_per_tx_usd * n * 4.3).toFixed(2);
   if (gas.tier === 'expensive') {
-    return `Do one qualifying action every two weeks on ${name} (${chain}) — a top-up, a borrow-and-repay, or a vote — and skip the in-between weeks: at ${gas.cost_label} a transaction, weekly churn costs more than it adds. Cost: about $${(gas.cost_per_tx_usd * 2.15).toFixed(0)} a month in gas. Time: 15 minutes every two weeks, ${CONFIG.farm_horizon_weeks} weeks.`;
+    return `Do one qualifying action every two weeks on ${name} (${chain}) — a top-up, a borrow-and-repay, or a vote — and skip the in-between weeks: at ${gas.cost_label} a transaction, weekly churn costs more than it adds. Cost: about $${(gas.cost_per_tx_usd * 2.15).toFixed(0)} a month in gas. Time: 15 minutes every two weeks, ${CONFIG.farm_weeks} weeks.`;
   }
   if (gas.tier === 'solana') {
-    return `Interact with ${name} on ${chain} about ${n} times a week — small swaps, deposits and votes — since each transaction costs ${gas.cost_label}. Cost: about $${cost} of gas over 30 days. Time: 10 minutes a week, ${CONFIG.farm_horizon_weeks} weeks.`;
+    return `Interact with ${name} on ${chain} about ${n} times a week — small swaps, deposits and votes — since each transaction costs ${gas.cost_label}. Cost: about $${cost} of gas over 30 days. Time: 10 minutes a week, ${CONFIG.farm_weeks} weeks.`;
   }
   const extra = pb === 'dex' ? ' Route the volume across different pairs each week.' : pb === 'yield' ? ' Move a slice between vaults once a month if a new points epoch opens.' : '';
-  return `Do about ${n} qualifying actions a week on ${name} (${chain}) — deposits, swaps, votes or claims — gas is ${gas.cost_label} a transaction.${extra} Cost: about $${cost} of gas over 30 days. Time: 15 minutes a week, ${CONFIG.farm_horizon_weeks} weeks.`;
+  return `Do about ${n} qualifying actions a week on ${name} (${chain}) — deposits, swaps, votes or claims — gas is ${gas.cost_label} a transaction.${extra} Cost: about $${cost} of gas over 30 days. Time: 15 minutes a week, ${CONFIG.farm_weeks} weeks.`;
 }
 
 /** Hold length from the protocol's age: younger protocols get a longer window. */
@@ -349,8 +349,8 @@ export function farmPlan(p: SnapshotProtocol, age: number | null, perWalletUsd: 
     `Open a fresh wallet that holds only the funds you plan to farm on ${p.name}, and keep its seed phrase offline. Fund it with ${capital} plus gas for the first transaction on ${chain}. Cost: one transaction at ${gas.cost_label}. Time: 10 minutes to set up.`,
     coreAction(pb, p.name, chain, capital, gas, big),
     cadenceStep(pb, p.name, chain, gas, capital),
-    `Hold the position for at least ${hold} days and open ${p.name}'s own points or rewards page once a month to check the activity is counted. Cost: no fee to check. Time: 10 minutes a month for ${CONFIG.farm_horizon_weeks} weeks.`,
-    `When the horizon ends, claim only from the link ${p.name} itself publishes, never pay to claim, and write the wallet, dates and every transaction in a farm log before you unwind. Cost: one exit transaction at ${gas.cost_label}. Time: 15 minutes.`,
+    `Hold the position for at least ${hold} days and open ${p.name}'s own points or rewards page once a month to check the activity is counted. Cost: no fee to check. Time: 10 minutes a month for ${CONFIG.farm_weeks} weeks.`,
+    `When the 12 weeks end, claim only from the link ${p.name} itself publishes, never pay to claim, and write the wallet, dates and every transaction in a farm log before you unwind. Cost: one exit transaction at ${gas.cost_label}. Time: 15 minutes.`,
   ];
   return {
     steps: steps.map((s) => {

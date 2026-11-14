@@ -267,7 +267,7 @@
     });
     return el('div', { class: 'panel' },
       el('div', { class: 'table-wrap' },
-        el('table', null,
+        el('table', { class: 'board-table' },
           el('caption', { class: 'muted', text: 'Pre-token protocols, strongest implied value first. Select a row for its comps math and farming plan.' }),
           el('thead', null, el('tr', null,
             sortHeader('implied', 'Rank'),
