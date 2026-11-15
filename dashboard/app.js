@@ -34,6 +34,12 @@
     if (days >= 365) return (days / 365).toFixed(1) + 'y';
     return Math.max(0, Math.round(days)) + 'd';
   }
+  function fmtMinutes(min) {
+    if (min === null || min === undefined || !isFinite(min)) return 'n/a';
+    if (min < 60) return min + ' min';
+    var h = Math.floor(min / 60), m = min % 60;
+    return m > 0 ? h + 'h ' + m + 'm' : h + 'h';
+  }
   function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
 
   function el(tag, attrs) {
@@ -107,6 +113,7 @@
       else if (key === 'growth') { av = a.change_7d === null ? -Infinity : a.change_7d; bv = b.change_7d === null ? -Infinity : b.change_7d; }
       else if (key === 'age') { av = a.age_days === null ? Infinity : a.age_days; bv = b.age_days === null ? Infinity : b.age_days; }
       else if (key === 'gas') { av = a.gas.gas_30d_usd; bv = b.gas.gas_30d_usd; }
+      else if (key === 'ev') { av = a.airdrop.per_wallet_usd; bv = b.airdrop.per_wallet_usd; }
       else if (key === 'efficiency') { av = a.gas.ev_gas_multiple === null ? -Infinity : a.gas.ev_gas_multiple; bv = b.gas.ev_gas_multiple === null ? -Infinity : b.gas.ev_gas_multiple; }
       else if (key === 'name') { av = a.name.toLowerCase(); bv = b.name.toLowerCase(); }
       else if (key === 'category') { av = (a.category || 'Other').toLowerCase(); bv = (b.category || 'Other').toLowerCase(); }
@@ -128,9 +135,9 @@
         )
       ),
       el('div', { class: 'formula-pill' },
-        'Est. FDV = Size-Fit Value \u00D7 7d Growth Mult \u00D7 Age Maturity Mult',
+        'Est. FDV = exp(fit on log TVL + log age + category offset) \u00D7 calibration',
         el('br'),
-        el('b', { text: 'Leave-one-out backtest on ' + DATA.backtest.tested + ' listed protocols: median error ' + DATA.backtest.mdape_pct.toFixed(2) + '% \u00B7 previous model ' + DATA.backtest.previous_mdape_pct.toFixed(2) + '%' })
+        el('b', { text: 'Leave-one-out backtest on ' + DATA.backtest.tested + ' listed protocols: median error ' + DATA.backtest.mdape_pct.toFixed(2) + '% \u00B7 v2 ' + DATA.backtest.previous_mdape_pct.toFixed(2) + '% \u00B7 v1 ' + DATA.backtest.first_mdape_pct.toFixed(2) + '%' })
       )
     );
   }
@@ -139,20 +146,63 @@
     var c = DATA.comps;
     var u = DATA.universe;
     var f = DATA.fit;
+    var coef = f.coefficients;
+    var chosenCv = null;
+    f.candidates.forEach(function (cand) { if (cand.chosen) chosenCv = cand.cv_mdape_pct; });
+    var candLines = f.candidates.map(function (cand) {
+      return cand.label + ' \u2014 CV ' + cand.cv_mdape_pct.toFixed(2) + '%' + (cand.chosen ? ' (chosen)' : '');
+    }).join('; ');
     var cells = [
       ['Universe', 'Launch candidates only: ' + DATA.board_size + ' of ' + DATA.pre_token_size + ' pre-token protocols. ' + u.excluded_categories.join(', ') + ' are out: venues and asset movers whose tokens already exist, or claims on existing assets. Of the rest, a protocol qualifies when its category holds at least ' + u.min_category_comps + ' live comps, when it sits on the watchlist, or when its TVL is at least ' + fmtUsd(u.min_tvl_usd) + '. All ' + DATA.watchlist_size + ' watchlist protocols are on the board.'],
-      ['Size fit', 'log(market cap) = ' + f.global_intercept.toFixed(4) + ' + ' + f.global_slope.toFixed(4) + ' \u00D7 log(TVL), fitted on ' + c.pool_size + ' live-token protocols across ' + c.categories_with_comps + ' categories with robust Huber weights, so one outsized listing cannot bend the line. A slope under 1 means value grows slower than TVL.'],
-      ['Category blend', 'A category with at least ' + DATA.config.category_line_min_comps + ' comps gets its own fitted line, blended with the global line at weight n/(n+' + DATA.config.blend_shrink_k + ') on the category. Below that, the global line stands plus the category\u2019s median residual, shrunk by the same weight. ' + f.line_categories + ' categories carry their own line; ' + f.offset_categories + ' ride the global line with an offset.'],
-      ['Backtest', 'Leave-one-out on all ' + DATA.backtest.tested + ' listed protocols: each market cap is predicted from a fit that excludes it, growth and maturity left out. Median error ' + DATA.backtest.mdape_pct.toFixed(2) + '%, median signed error ' + fmtPct(DATA.backtest.median_signed_pct) + '. The previous model, category median multiples, posted a median error of ' + DATA.backtest.previous_mdape_pct.toFixed(2) + '%.'],
-      ['Growth', '1 + clamp(7-day TVL change, \u221250%, +100%) / 100 \u00D7 ' + DATA.config.growth_weight + '. A missing 7-day change counts as no growth (multiplier 1).'],
-      ['Maturity', '0.70 + 0.50 \u00D7 min(age in days, 1460) / 1460. A protocol with no listing date uses 0.95: no bonus, no penalty beyond it.'],
-      ['Own claims', 'Implied values, airdrop pools and per-wallet figures are this board\u2019s own claims, never prices or promises. Airdrop pool: 15% of implied value for Dexs / Lending / Yield, 5% for CEX / Bridge, 10% otherwise. Per-wallet divides the pool by a rough active-wallet count by TVL tier (15k\u2013250k).']
+      ['Model selection', 'Eight candidate pipelines \u2014 feature set (log TVL alone, + log age, + age as a fraction of four years, + an age-missing flag) \u00D7 category shrinkage (k = 3, 4, 6) \u00D7 trimmed or untrimmed fit \u2014 are scored by 5-fold cross-validation on the ' + c.pool_size + ' listed protocols. A challenger replaces the default only when it scores better by more than ' + DATA.config.selection_margin_pct + ' points. On this snapshot the default stands: ' + f.chosen_label + (chosenCv !== null ? ', CV median error ' + chosenCv.toFixed(2) + '%' : '') + '. All eight scores: ' + candLines + '.'],
+      ['The fit', 'log(market cap) is fitted on log TVL and the chosen age term with robust Huber weights, then refitted on the points inside 2.2 median-absolute-deviation sigmas \u2014 ' + f.trimmed_count + ' of ' + c.pool_size + ' comps sit outside and are trimmed as outsized. Fitted coefficients on this snapshot: ' + coef.log_tvl.toFixed(4) + ' per unit of log TVL' + (coef.age !== null && coef.age !== undefined ? ', ' + coef.age.toFixed(4) + ' per unit of the age term' : '') + ', around a centred intercept of ' + coef.intercept_at_pool_mean.toFixed(4) + ' (the prediction at the pool-average profile, before offsets and calibration).'],
+      ['Category offsets', 'Each category adds its median residual to the global surface, shrunk by n/(n+' + f.cat_k + '): a category with 4 comps counts half its offset, one with 36 counts nine-tenths. ' + c.categories_with_comps + ' categories carry an offset; a protocol in a category with no listed comps prices off the global surface alone.'],
+      ['Calibration', 'A constant multiplier of ' + f.calibration_factor.toFixed(4) + ' is applied to every fitted value: the log-space shift that zeroes the median signed percentage error of the pipeline\u2019s own out-of-fold predictions on the listed protocols. It corrects the small systematic tilt a trimmed fit leaves behind.'],
+      ['Backtest', 'Leave-one-out on all ' + DATA.backtest.tested + ' listed protocols: each market cap is predicted by the full procedure \u2014 selection, calibration, fit \u2014 run without it. Median error ' + DATA.backtest.mdape_pct.toFixed(2) + '%, median signed error ' + fmtPct(DATA.backtest.median_signed_pct) + '. The previous models scored worse on the same grade: v2 size fit ' + DATA.backtest.previous_mdape_pct.toFixed(2) + '%, v1 category medians ' + DATA.backtest.first_mdape_pct.toFixed(2) + '%.'],
+      ['Tested and rejected', 'Two snapshot fields are not in the price, because cross-validation scored them worse during development: 7-day TVL growth and chain count. Both still show on the board as data \u2014 the growth column and the chain tags \u2014 but neither moves a fitted value.'],
+      ['Own claims', 'Implied values, airdrop pools and per-wallet figures are this board\u2019s own claims, never prices or promises. Airdrop pool: 15% of implied value for Dexs / Lending / Yield, 5% for CEX / Bridge, 10% otherwise \u2014 the 5\u201315% band each farm plan states. Per-wallet divides the pool by a rough active-wallet count by TVL tier (15k\u2013250k).']
     ];
     return el('details', { class: 'method panel' },
       el('summary', { text: 'Methodology & Calibration \u2014 how each number is earned' }),
       el('div', { class: 'grid' }, cells.map(function (pair) {
         return el('div', { class: 'cell' }, el('b', { text: pair[0] }), document.createTextNode(pair[1]));
       }))
+    );
+  }
+
+  function sectorPanel() {
+    var byCat = {};
+    DATA.rows.forEach(function (r) {
+      var key = r.category || 'Other';
+      if (!byCat[key]) byCat[key] = { count: 0, fdv: 0, pool: 0 };
+      byCat[key].count += 1;
+      byCat[key].fdv += r.implied_value_usd;
+      byCat[key].pool += r.airdrop.pool_usd;
+    });
+    var cats = Object.keys(byCat).map(function (k) { return { name: k, count: byCat[k].count, fdv: byCat[k].fdv, pool: byCat[k].pool }; });
+    cats.sort(function (a, b) { return b.fdv - a.fdv; });
+    var top = cats.slice(0, 10);
+    if (cats.length > 10) {
+      var rest = { name: 'All other sectors', count: 0, fdv: 0, pool: 0 };
+      cats.slice(10).forEach(function (c) { rest.count += c.count; rest.fdv += c.fdv; rest.pool += c.pool; });
+      top.push(rest);
+    }
+    var max = top.length ? top[0].fdv : 1;
+    var W = 1320, rowH = 26, H = top.length * rowH + 8;
+    var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" role="img" aria-label="Board value by sector">';
+    top.forEach(function (c, i) {
+      var y = 6 + i * rowH;
+      var w = Math.max(2, Math.round((c.fdv / max) * 640));
+      var op = (0.95 - i * 0.055).toFixed(2);
+      svg += '<text x="0" y="' + (y + 13) + '" class="svg-lab">' + esc(c.name) + '</text>';
+      svg += '<rect x="230" y="' + y + '" width="' + w + '" height="16" rx="3" fill="#00FF9D" opacity="' + op + '"></rect>';
+      svg += '<text x="' + (240 + w) + '" y="' + (y + 13) + '" class="svg-val">' + esc(fmtUsd(c.fdv)) + ' \u00B7 ' + c.count + ' rows \u00B7 pool ' + esc(fmtUsd(c.pool)) + '</text>';
+    });
+    svg += '</svg>';
+    return el('section', { class: 'panel sector-panel' },
+      el('h3', { class: 'mono', text: 'SECTOR SWEEP \u2014 WHERE THE BOARD\u2019S IMPLIED VALUE SITS' }),
+      el('p', { class: 'sub', text: 'Aggregate estimated FDV and candidate count per sector, from the same fitted values as the board. The widest bar is the sector carrying the most pre-token value.' }),
+      el('div', { class: 'svg-wrap', html: svg })
     );
   }
 
@@ -195,8 +245,9 @@
     var sortSel = el('select', { id: 'sort', 'aria-label': 'Sort the board' },
       opt('implied', 'Est. FDV', state.sort),
       opt('tvl', 'TVL', state.sort),
-      opt('growth', '7d Growth', state.sort),
+      opt('ev', 'Airdrop EV / wallet', state.sort),
       opt('efficiency', 'EV / Gas Efficiency', state.sort),
+      opt('growth', '7d Growth', state.sort),
       opt('age', 'Age', state.sort),
       opt('gas', '30d Gas (low first)', state.sort));
     sortSel.addEventListener('change', function () { state.sort = sortSel.value; state.dir = state.sort === 'gas' ? 1 : -1; writeHash(); update(); });
@@ -303,7 +354,7 @@
     });
     return el('section', { class: 'panel live-table' },
       el('h3', { class: 'mono', text: 'COMPS EVIDENCE \u2014 TOP 24 LIVE-TOKEN PROTOCOLS BY MARKET CAP' }),
-      el('p', { class: 'sub', text: 'These protocols already trade. The size fit is fitted on their market caps and TVLs \u2014 the market\u2019s own values, set apart from the pre-token ranking.' }),
+      el('p', { class: 'sub', text: 'These protocols already trade. The fit is fitted on their market caps and TVLs \u2014 the market\u2019s own values, set apart from the pre-token ranking.' }),
       el('div', { class: 'table-wrap' },
         el('table', null,
           el('thead', null, el('tr', null,
@@ -313,6 +364,37 @@
         )
       )
     );
+  }
+
+  // ---- farm plan export ---------------------------------------------------
+  function planText(row) {
+    var m = row.model;
+    var eff = row.gas.ev_gas_multiple;
+    var lines = [
+      'TOKEN RADAR \u2014 FARM PLAN',
+      row.name + ' \u00B7 rank #' + row.rank + ' of ' + DATA.board_size + ' \u00B7 ' + (row.category || 'Other') + ' \u00B7 ' + (row.chains || []).join(', '),
+      'Snapshot ' + DATA.as_of + ' \u00B7 model ' + DATA.model_version + ' (' + DATA.fit.chosen_label + ')',
+      '',
+      'Est. token FDV: ' + fmtNum(row.implied_value_usd) + ' (fitted multiple ' + m.fitted_multiple.toFixed(4) + 'x, ' + m.fit_source + ' fit, ' + m.comp_count + ' category comps, offset weight ' + m.fit_weight.toFixed(2) + ')',
+      'Airdrop pool (' + Math.round(row.airdrop.share_pct * 100) + '% of FDV): ' + fmtNum(row.airdrop.pool_usd) + ' \u00B7 per wallet ' + fmtNum(row.airdrop.per_wallet_usd) + ' across ' + row.airdrop.wallets_assumed.toLocaleString('en-US') + ' assumed wallets',
+      'EV-to-gas: ' + (eff === null ? 'n/a' : eff + 'x') + ' (' + row.airdrop.ev_rating + ') \u00B7 gas ' + row.gas.cost_label + ' per tx \u00B7 ' + fmtGas(row.gas.gas_30d_usd) + ' per 30 days \u00B7 ' + fmtGas(row.gas.total_plan_gas_usd) + ' over 12 weeks',
+      'Capital: ' + row.capital_range + ' \u00B7 hands-on time: about ' + fmtMinutes(row.total_minutes) + ' over 12 weeks',
+      '',
+      'Steps:'
+    ];
+    row.farm_steps.forEach(function (s, i) { lines.push((i + 1) + '. ' + s); });
+    lines.push('');
+    lines.push('Implied values and airdrop figures are this board\u2019s own claims, never prices or promises.');
+    return lines.join('\n');
+  }
+  function exportPlan(row) {
+    var blob = new Blob([planText(row)], { type: 'text/plain' });
+    var url = URL.createObjectURL(blob);
+    var a = el('a', { href: url, download: row.slug + '-farm-plan.txt' });
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
   }
 
   // ---- detail modal -------------------------------------------------------
@@ -335,18 +417,21 @@
     var formula = el('div', { class: 'formula-bar' },
       el('div', { class: 'step' }, el('span', { class: 'lab', text: 'Current TVL' }), el('b', { text: fmtUsd(row.tvl_usd) })),
       el('span', { class: 'op', text: '\u00D7' }),
-      el('div', { class: 'step' }, el('span', { class: 'lab', text: 'Size-fit FDV / TVL' }), el('b', { text: m.fitted_multiple.toFixed(4) + 'x' }), el('span', { class: 'lab', text: m.fit_source === 'category' ? 'category line \u00B7 ' + m.comp_count + ' comps \u00B7 weight ' + m.fit_weight.toFixed(2) : 'global line \u00B7 ' + m.comp_count + ' category comps' })),
+      el('div', { class: 'step' }, el('span', { class: 'lab', text: 'Fitted FDV / TVL' }), el('b', { text: m.fitted_multiple.toFixed(4) + 'x' }), el('span', { class: 'lab', text: m.fit_source === 'category' ? 'category offset carries \u00B7 ' + m.comp_count + ' comps \u00B7 weight ' + m.fit_weight.toFixed(2) : 'global surface \u00B7 ' + m.comp_count + ' category comps \u00B7 offset weight ' + m.fit_weight.toFixed(2) })),
       el('span', { class: 'op', text: '\u00D7' }),
-      el('div', { class: 'step' }, el('span', { class: 'lab', text: '7d Growth Mult' }), el('b', { text: m.growth_multiplier.toFixed(4) + 'x' })),
+      el('div', { class: 'step' }, el('span', { class: 'lab', text: 'Category Offset' }), el('b', { text: '\u00D7' + m.category_factor.toFixed(4) })),
       el('span', { class: 'op', text: '\u00D7' }),
-      el('div', { class: 'step' }, el('span', { class: 'lab', text: 'Age Maturity Mult' }), el('b', { text: m.maturity_multiplier.toFixed(4) + 'x' })),
+      el('div', { class: 'step' }, el('span', { class: 'lab', text: 'Calibration' }), el('b', { text: '\u00D7' + m.calibration_factor.toFixed(4) })),
       el('span', { class: 'op', text: '=' }),
       el('div', { class: 'step result' }, el('span', { class: 'lab', text: 'Est. Token FDV' }), el('b', { text: fmtUsd(row.implied_value_usd) }))
     );
-    var peers = el('div', { class: 'peers' }, m.peers.map(function (p) {
-      return el('span', { class: 'peer' }, document.createTextNode(p.name + ' '), el('b', { text: p.ratio.toFixed(4) + 'x' }));
+    var factors = el('div', { class: 'peers' }, m.factors.map(function (f) {
+      return el('span', { class: 'peer' }, document.createTextNode(f.label + ' '), el('b', { text: '\u00D7' + f.factor.toFixed(4) }));
     }));
-    if (m.floor_estimate) peers.appendChild(el('span', { class: 'peer', text: 'Floor estimate: no positive TVL on record, priced from the global fit at the category median TVL' }));
+    var peers = el('div', { class: 'peers' }, m.peers.map(function (p) {
+      return el('span', { class: 'peer' }, document.createTextNode(p.name + ' '), el('b', { text: p.ratio.toFixed(4) + 'x' }), document.createTextNode(' \u00B7 ' + fmtUsd(p.mcap_usd)));
+    }));
+    if (m.floor_estimate) peers.appendChild(el('span', { class: 'peer', text: 'Floor estimate: no positive TVL on record, priced from the fit at the category median TVL' }));
     var steps = el('ol', { class: 'steps' }, row.farm_steps.map(function (s, i) {
       return el('li', null, el('span', { class: 'step-no', text: 'STEP 0' + (i + 1) + ':' }), document.createTextNode(s));
     }));
@@ -360,12 +445,14 @@
         el('button', { class: 'close', type: 'button', 'aria-label': 'Close details', text: 'Close', onclick: function () { dialog.close(); } })
       ),
       el('section', { class: 'sec' },
-        el('h3', null, el('span', { text: '01 // ' }), document.createTextNode('Size-fit valuation breakdown')),
+        el('h3', null, el('span', { text: '01 // ' }), document.createTextNode('Multi-feature valuation breakdown')),
         el('span', { class: 'eff-badge', text: 'Est. airdrop pool (' + Math.round(row.airdrop.share_pct * 100) + '%): ' + fmtUsd(row.airdrop.pool_usd) }),
         formula,
-        el('p', { class: 'sub', text: 'Listed peer comps in this category, the fit\u2019s own evidence:' }),
+        el('p', { class: 'sub', text: 'Strongest contributing factors, against the pool-average listed protocol:' }),
+        factors,
+        el('p', { class: 'sub', text: 'Nearest listed peers by TVL, the fit\u2019s own evidence (same sector first):' }),
         peers,
-        el('p', { class: 'note', text: 'Base ' + fmtNum(m.base_usd) + ' = the fitted value at this TVL, TVL \u00D7 ' + m.fitted_multiple.toFixed(4) + 'x. Per-wallet figure: ' + fmtUsd(row.airdrop.per_wallet_usd) + ' (pool \u00F7 ' + row.airdrop.wallets_assumed.toLocaleString('en-US') + ' assumed active wallets for this TVL tier \u2014 the board\u2019s own assumption, never a promise).' })
+        el('p', { class: 'note', text: 'Base ' + fmtNum(m.base_usd) + ' = the fitted value at this TVL, TVL \u00D7 ' + m.fitted_multiple.toFixed(4) + 'x. Per-wallet figure: ' + fmtUsd(row.airdrop.per_wallet_usd) + ' (pool \u00F7 ' + row.airdrop.wallets_assumed.toLocaleString('en-US') + ' assumed active wallets for this TVL tier \u2014 the board\u2019s own assumption, never a promise). EV rating: ' + row.airdrop.ev_rating + '.' })
       ),
       el('section', { class: 'sec' },
         el('h3', null, el('span', { text: '02 // ' }), document.createTextNode('Concrete farming plan & chain gas telemetry')),
@@ -375,7 +462,13 @@
           el('div', { class: 'cell' }, el('div', { class: 'lab', text: 'Est. 30-day gas (' + row.gas.actions_per_week + ' actions / week)' }), el('div', { class: 'val', text: fmtGas(row.gas.gas_30d_usd) })),
           el('div', { class: 'cell' }, el('div', { class: 'lab', text: 'Recommended min capital' }), el('div', { class: 'val cyn', text: row.capital_range }))
         ),
-        steps
+        el('div', { class: 'stats3' },
+          el('div', { class: 'cell' }, el('div', { class: 'lab', text: 'Total gas, 12 weeks' }), el('div', { class: 'val', text: fmtGas(row.gas.total_plan_gas_usd) })),
+          el('div', { class: 'cell' }, el('div', { class: 'lab', text: 'Total hands-on time' }), el('div', { class: 'val', text: fmtMinutes(row.total_minutes) })),
+          el('div', { class: 'cell' }, el('div', { class: 'lab', text: 'Est. airdrop EV / wallet' }), el('div', { class: 'val cyn', text: fmtUsd(row.airdrop.per_wallet_usd) }))
+        ),
+        steps,
+        el('button', { class: 'btn primary export-btn', type: 'button', text: 'EXPORT THIS PLAN (.TXT)', onclick: function () { exportPlan(row); } })
       )
     );
     dialog.appendChild(body);
@@ -404,6 +497,7 @@
     metaSlot = el('div', { class: 'meta' });
     tableSlot = el('div');
     shell.appendChild(kpiSlot);
+    shell.appendChild(sectorPanel());
     shell.appendChild(controls());
     shell.appendChild(metaSlot);
     shell.appendChild(tableSlot);

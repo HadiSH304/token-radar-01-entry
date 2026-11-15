@@ -111,6 +111,14 @@ dialog.detail::backdrop{background:rgba(2,4,8,.72);backdrop-filter:blur(3px)}
 ol.steps{list-style:none;margin:12px 0 0;padding:0}
 ol.steps li{border-left:3px solid var(--grn);padding:8px 12px;margin-bottom:8px;background:rgba(0,255,157,.04);border-radius:0 8px 8px 0;font-size:13.5px}
 ol.steps li .step-no{font-family:var(--mono);color:var(--grn);font-size:11.5px;letter-spacing:.08em;display:block;margin-bottom:2px}
+/* sector sweep */
+.sector-panel{margin-top:14px}
+.sector-panel h3{font-size:12px;letter-spacing:.1em;color:var(--tx);margin:0 0 4px}
+.svg-wrap{margin-top:10px;overflow-x:auto}
+.svg-wrap svg{display:block;min-width:760px}
+.svg-lab{fill:var(--tx2);font-size:12.5px;font-family:var(--sans)}
+.svg-val{fill:var(--cyn);font-size:12.5px;font-family:var(--mono)}
+.export-btn{margin-top:12px}
 /* live evidence */
 .live-table{margin-top:14px}
 .live-table table{font-size:12.5px}
