@@ -1,4 +1,4 @@
-// Token Radar v2: size-fitted token launch radar (Node 22, standard library only).
+// Token Radar v3: cross-validated multi-feature token launch radar (Node 22, standard library only).
 //
 // Reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>),
 // scores every pre-token protocol with the model in lib/model.ts, writes the
@@ -89,6 +89,7 @@ const top3 = board.slice(0, 3).map((r) => `#${r.rank} ${r.name} ${fmtUsd(r.impli
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored\n` +
     `token radar: comps pool ${radar.comps.pool_size} live protocols, backtest on ${radar.backtest.tested} listed protocols, median error ${radar.backtest.mdape_pct.toFixed(2)}%\n` +
+    `token radar: selected pipeline: ${radar.fit.chosen_label} (calibration x${radar.fit.calibration_factor.toFixed(4)})\n` +
     `token radar: top 3 by implied value: ${top3}\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')}, ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
